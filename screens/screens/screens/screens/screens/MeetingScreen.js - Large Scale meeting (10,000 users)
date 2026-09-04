@@ -1,0 +1,684 @@
+// screens/MeetingScreen.js - Large Scale Meeting (10,000 users)
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  TextInput,
+  Alert,
+  ActivityIndicator,
+  ScrollView,
+  FlatList,
+  Modal,
+  Platform,
+} from 'react-native';
+import Icon from 'react-native-vector-icons/MaterialIcons';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import { useLanguage } from '../context/LanguageContext';
+import { translations } from '../utils/translations';
+import { socketService } from '../services/socketService';
+import { RTCPeerConnection, RTCView, mediaDevices } from 'react-native-webrtc';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Database from '../utils/database';
+import { v4 as uuidv4 } from 'uuid';
+
+export default function MeetingScreen({ navigation }) {
+  const { language } = useLanguage();
+  const t = translations[language];
+  
+  const [user, setUser] = useState(null);
+  const [meetingId, setMeetingId] = useState('');
+  const [isHost, setIsHost] = useState(false);
+  const [meetings, setMeetings] = useState([]);
+  const [joinMeetingId, setJoinMeetingId] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [meetingType, setMeetingType] = useState('video');
+  const [participants, setParticipants] = useState([]);
+  const [isInMeeting, setIsInMeeting] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [meetingTopic, setMeetingTopic] = useState('');
+  const [maxParticipants, setMaxParticipants] = useState('10000');
+
+  const localStream = useRef(null);
+  const peerConnections = useRef({});
+
+  useEffect(() => {
+    loadUserData();
+    setupSocketListeners();
+    return () => cleanup();
+  }, []);
+
+  const loadUserData = async () => {
+    try {
+      const userData = await AsyncStorage.getItem('@pchat_user');
+      if (userData) {
+        setUser(JSON.parse(userData));
+      }
+      loadMeetings();
+    } catch (error) {
+      console.error('Load user error:', error);
+    }
+  };
+
+  const loadMeetings = async () => {
+    try {
+      const allMeetings = await Database.getAllMeetings();
+      const activeMeetings = allMeetings.filter(m => 
+        m.status === 'active' || m.status === 'scheduled'
+      );
+      setMeetings(activeMeetings);
+    } catch (error) {
+      console.error('Load meetings error:', error);
+    }
+  };
+
+  const setupSocketListeners = () => {
+    socketService.on('meetingCreated', (data) => {
+      Alert.alert('Meeting Created', `Meeting ID: ${data.meetingId}`);
+      setShowCreateModal(false);
+      loadMeetings();
+    });
+
+    socketService.on('meetingJoined', (data) => {
+      Alert.alert('Joined Meeting', `You joined ${data.topic}`);
+      setIsInMeeting(true);
+      setParticipants(data.participants || []);
+    });
+
+    socketService.on('newParticipant', (data) => {
+      setParticipants(prev => [...prev, data.participant]);
+      if (isHost) {
+        // Accept new participant
+        socketService.emit('acceptParticipant', {
+          meetingId: meetingId,
+          participantId: data.participant.id,
+        });
+      }
+    });
+
+    socketService.on('participantLeft', (data) => {
+      setParticipants(prev => prev.filter(p => p.id !== data.participantId));
+    });
+
+    socketService.on('meetingEnded', () => {
+      Alert.alert('Meeting Ended', 'The host has ended the meeting');
+      leaveMeeting();
+    });
+  };
+
+  const createMeeting = async () => {
+    if (!meetingTopic.trim()) {
+      Alert.alert(t.error, t.enterMeetingTopic);
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const newMeeting = {
+        id: uuidv4(),
+        topic: meetingTopic,
+        hostId: user.id,
+        hostName: user.name,
+        type: meetingType,
+        maxParticipants: parseInt(maxParticipants),
+        participants: [{
+          id: user.id,
+          name: user.name,
+          role: 'host',
+          joinedAt: new Date().toISOString(),
+        }],
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+      };
+
+      await Database.saveMeeting(newMeeting);
+      socketService.emit('createMeeting', newMeeting);
+      
+      setMeetingId(newMeeting.id);
+      setIsHost(true);
+      setParticipants(newMeeting.participants);
+      setIsInMeeting(true);
+      
+      // Start local stream
+      await startLocalStream();
+      
+      navigation.navigate('MeetingRoom', { 
+        meetingId: newMeeting.id, 
+        isHost: true,
+        meetingData: newMeeting,
+      });
+    } catch (error) {
+      console.error('Create meeting error:', error);
+      Alert.alert(t.error, t.meetingCreationFailed);
+    } finally {
+      setIsLoading(false);
+      setShowCreateModal(false);
+    }
+  };
+
+  const joinMeeting = async () => {
+    if (!joinMeetingId.trim()) {
+      Alert.alert(t.error, t.enterMeetingId);
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const meeting = await Database.getMeetingById(joinMeetingId);
+      if (!meeting) {
+        Alert.alert(t.error, t.meetingNotFound);
+        return;
+      }
+
+      if (meeting.participants.length >= meeting.maxParticipants) {
+        Alert.alert(t.error, t.meetingFull);
+        return;
+      }
+
+      // Check if user has premium features for large meetings
+      if (meeting.maxParticipants > 100 && user.balance < 10) {
+        Alert.alert(
+          'Premium Feature',
+          'Meetings with more than 100 participants require premium access. Please upgrade your account.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Upgrade', onPress: () => navigation.navigate('Payment', { 
+              amount: 10, 
+              purpose: 'premium_meeting' 
+            })},
+          ]
+        );
+        return;
+      }
+
+      socketService.emit('joinMeeting', {
+        meetingId: meeting.id,
+        participant: {
+          id: user.id,
+          name: user.name,
+          joinedAt: new Date().toISOString(),
+        },
+      });
+
+      setMeetingId(meeting.id);
+      setIsHost(false);
+      setIsInMeeting(true);
+      
+      await startLocalStream();
+      
+      navigation.navigate('MeetingRoom', { 
+        meetingId: meeting.id, 
+        isHost: false,
+        meetingData: meeting,
+      });
+    } catch (error) {
+      console.error('Join meeting error:', error);
+      Alert.alert(t.error, t.meetingJoinFailed);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const startLocalStream = async () => {
+    try {
+      const stream = await mediaDevices.getUserMedia({
+        audio: true,
+        video: meetingType === 'video',
+      });
+      localStream.current = stream;
+      return stream;
+    } catch (error) {
+      console.error('Stream error:', error);
+      Alert.alert(t.error, t.streamAccessDenied);
+      return null;
+    }
+  };
+
+  const leaveMeeting = () => {
+    setIsInMeeting(false);
+    setParticipants([]);
+    setMeetingId('');
+    setIsHost(false);
+    if (localStream.current) {
+      localStream.current.getTracks().forEach(track => track.stop());
+      localStream.current = null;
+    }
+    // Cleanup peer connections
+    Object.values(peerConnections.current).forEach(pc => pc.close());
+    peerConnections.current = {};
+  };
+
+  const cleanup = () => {
+    socketService.off('meetingCreated');
+    socketService.off('meetingJoined');
+    socketService.off('newParticipant');
+    socketService.off('participantLeft');
+    socketService.off('meetingEnded');
+    leaveMeeting();
+  };
+
+  const renderMeetingItem = ({ item }) => (
+    <TouchableOpacity 
+      style={styles.meetingItem}
+      onPress={() => {
+        setJoinMeetingId(item.id);
+        joinMeeting();
+      }}
+    >
+      <View style={styles.meetingIcon}>
+        <Icon name={item.type === 'video' ? 'videocam' : 'call'} size={24} color="#fff" />
+      </View>
+      <View style={styles.meetingInfo}>
+        <Text style={styles.meetingTopic}>{item.topic}</Text>
+        <Text style={styles.meetingHost}>Host: {item.hostName}</Text>
+        <View style={styles.meetingDetails}>
+          <Text style={styles.meetingMeta}>
+            {item.participants.length}/{item.maxParticipants} {t.participants}
+          </Text>
+          <Text style={styles.meetingMeta}>
+            {item.type === 'video' ? '📹' : '🎧'} 
+          </Text>
+        </View>
+      </View>
+      <Icon name="chevron-right" size={24} color="#ccc" />
+    </TouchableOpacity>
+  );
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()}>
+          <Icon name="arrow-back" size={24} color="#fff" />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>{t.meetings}</Text>
+        <TouchableOpacity onPress={() => setShowCreateModal(true)}>
+          <Icon name="add" size={24} color="#fff" />
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.joinContainer}>
+        <TextInput
+          style={styles.joinInput}
+          placeholder={t.enterMeetingId}
+          placeholderTextColor="#999"
+          value={joinMeetingId}
+          onChangeText={setJoinMeetingId}
+        />
+        <TouchableOpacity 
+          style={styles.joinButton}
+          onPress={joinMeeting}
+          disabled={isLoading}
+        >
+          {isLoading ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <Text style={styles.joinButtonText}>{t.join}</Text>
+          )}
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.meetingTypeSelector}>
+        <TouchableOpacity 
+          style={[styles.typeButton, meetingType === 'video' && styles.activeType]}
+          onPress={() => setMeetingType('video')}
+        >
+          <Icon name="videocam" size={20} color={meetingType === 'video' ? '#fff' : '#075E54'} />
+          <Text style={[styles.typeText, meetingType === 'video' && styles.activeTypeText]}>
+            {t.videoCall}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity 
+          style={[styles.typeButton, meetingType === 'voice' && styles.activeType]}
+          onPress={() => setMeetingType('voice')}
+        >
+          <Icon name="call" size={20} color={meetingType === 'voice' ? '#fff' : '#075E54'} />
+          <Text style={[styles.typeText, meetingType === 'voice' && styles.activeTypeText]}>
+            {t.voiceCall}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      <Text style={styles.sectionTitle}>{t.activeMeetings}</Text>
+
+      <FlatList
+        data={meetings}
+        keyExtractor={(item) => item.id}
+        renderItem={renderMeetingItem}
+        contentContainerStyle={styles.meetingsList}
+        ListEmptyComponent={() => (
+          <View style={styles.emptyContainer}>
+            <Icon name="group" size={64} color="#ccc" />
+            <Text style={styles.emptyText}>{t.noActiveMeetings}</Text>
+            <Text style={styles.emptySubtext}>{t.createMeetingPrompt}</Text>
+          </View>
+        )}
+      />
+
+      {/* Create Meeting Modal */}
+      <Modal
+        visible={showCreateModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowCreateModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>{t.createMeeting}</Text>
+            
+            <TextInput
+              style={styles.modalInput}
+              placeholder={t.meetingTopic}
+              placeholderTextColor="#999"
+              value={meetingTopic}
+              onChangeText={setMeetingTopic}
+            />
+            
+            <View style={styles.modalRow}>
+              <Text style={styles.modalLabel}>{t.maxParticipants}</Text>
+              <TextInput
+                style={styles.modalInputSmall}
+                placeholder="10000"
+                keyboardType="numeric"
+                value={maxParticipants}
+                onChangeText={setMaxParticipants}
+              />
+            </View>
+
+            <View style={styles.modalRow}>
+              <Text style={styles.modalLabel}>{t.meetingType}</Text>
+              <View style={styles.typeSelector}>
+                <TouchableOpacity 
+                  style={[styles.modalTypeBtn, meetingType === 'video' && styles.activeModalType]}
+                  onPress={() => setMeetingType('video')}
+                >
+                  <Icon name="videocam" size={20} color={meetingType === 'video' ? '#fff' : '#075E54'} />
+                  <Text style={[styles.modalTypeText, meetingType === 'video' && styles.activeModalTypeText]}>
+                    {t.video}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                  style={[styles.modalTypeBtn, meetingType === 'voice' && styles.activeModalType]}
+                  onPress={() => setMeetingType('voice')}
+                >
+                  <Icon name="call" size={20} color={meetingType === 'voice' ? '#fff' : '#075E54'} />
+                  <Text style={[styles.modalTypeText, meetingType === 'voice' && styles.activeModalTypeText]}>
+                    {t.voice}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity 
+                style={[styles.modalButton, styles.cancelModalButton]}
+                onPress={() => setShowCreateModal(false)}
+              >
+                <Text style={styles.cancelModalButtonText}>{t.cancel}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={[styles.modalButton, styles.createModalButton]}
+                onPress={createMeeting}
+                disabled={isLoading}
+              >
+                {isLoading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.createModalButtonText}>{t.create}</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+  },
+  header: {
+    backgroundColor: '#075E54',
+    paddingTop: Platform.OS === 'ios' ? 50 : 30,
+    paddingBottom: 15,
+    paddingHorizontal: 15,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  headerTitle: {
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  joinContainer: {
+    flexDirection: 'row',
+    paddingHorizontal: 15,
+    marginTop: 15,
+  },
+  joinInput: {
+    flex: 1,
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    paddingHorizontal: 15,
+    fontSize: 16,
+    height: 50,
+    marginRight: 10,
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  joinButton: {
+    backgroundColor: '#075E54',
+    paddingHorizontal: 25,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+    height: 50,
+  },
+  joinButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  meetingTypeSelector: {
+    flexDirection: 'row',
+    paddingHorizontal: 15,
+    marginTop: 15,
+  },
+  typeButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+    paddingVertical: 12,
+    marginHorizontal: 5,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  activeType: {
+    backgroundColor: '#075E54',
+    borderColor: '#075E54',
+  },
+  typeText: {
+    marginLeft: 5,
+    color: '#075E54',
+    fontWeight: '500',
+  },
+  activeTypeText: {
+    color: '#fff',
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+    marginHorizontal: 15,
+    marginTop: 20,
+    marginBottom: 10,
+  },
+  meetingsList: {
+    paddingHorizontal: 15,
+  },
+  meetingItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    paddingHorizontal: 15,
+    paddingVertical: 12,
+    marginTop: 5,
+    borderRadius: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 1,
+  },
+  meetingIcon: {
+    width: 45,
+    height: 45,
+    borderRadius: 22.5,
+    backgroundColor: '#075E54',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  meetingInfo: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  meetingTopic: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#333',
+  },
+  meetingHost: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 2,
+  },
+  meetingDetails: {
+    flexDirection: 'row',
+    marginTop: 4,
+  },
+  meetingMeta: {
+    fontSize: 11,
+    color: '#999',
+    marginRight: 10,
+  },
+  emptyContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 50,
+  },
+  emptyText: {
+    fontSize: 16,
+    color: '#666',
+    marginTop: 10,
+  },
+  emptySubtext: {
+    fontSize: 14,
+    color: '#999',
+    marginTop: 5,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    backgroundColor: '#fff',
+    borderRadius: 20,
+    padding: 20,
+    width: '90%',
+    maxWidth: 400,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#333',
+    marginBottom: 20,
+  },
+  modalInput: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 10,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
+    fontSize: 16,
+    marginBottom: 15,
+  },
+  modalRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 15,
+  },
+  modalLabel: {
+    fontSize: 14,
+    color: '#333',
+    width: 120,
+  },
+  modalInputSmall: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 10,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
+    fontSize: 16,
+  },
+  typeSelector: {
+    flexDirection: 'row',
+    flex: 1,
+  },
+  modalTypeBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    marginHorizontal: 3,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  activeModalType: {
+    backgroundColor: '#075E54',
+    borderColor: '#075E54',
+  },
+  modalTypeText: {
+    marginLeft: 5,
+    color: '#075E54',
+  },
+  activeModalTypeText: {
+    color: '#fff',
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 10,
+  },
+  modalButton: {
+    paddingHorizontal: 25,
+    paddingVertical: 12,
+    borderRadius: 10,
+    marginLeft: 10,
+  },
+  cancelModalButton: {
+    backgroundColor: '#e0e0e0',
+  },
+  cancelModalButtonText: {
+    color: '#333',
+  },
+  createModalButton: {
+    backgroundColor: '#075E54',
+  },
+  createModalButtonText: {
+    color: '#fff',
+    fontWeight: 'bold',
+  },
+});
